@@ -1,0 +1,176 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>Streaming Live RAG Engine Dashboard</title>
+    <style>
+        body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; background: #0f172a; color: #f8fafc; margin: 0; padding: 20px; }
+        .grid { display: grid; grid-template-columns: 1fr 420px; gap: 20px; }
+        .card { background: #1e293b; border-radius: 8px; padding: 16px; border: 1px solid #334155; margin-bottom: 16px; }
+        #chat-box { height: 320px; overflow-y: auto; background: #0f172a; border-radius: 6px; padding: 12px; font-family: monospace; white-space: pre-wrap; }
+        .patch-btn { background: #e11d48; color: white; border: none; padding: 8px 12px; border-radius: 4px; cursor: pointer; font-weight: bold; }
+        .interrupted { color: #fbbf24; }
+        .waiting { color: #94a3b8; font-style: italic; }
+        pre { font-size: 0.82em; color: #38bdf8; overflow-x: auto; }
+        .stat { margin: 4px 0; }
+        table { width: 100%; border-collapse: collapse; font-size: 0.82em; margin-top: 8px; }
+        th, td { text-align: left; padding: 4px 6px; border-bottom: 1px solid #334155; }
+        th { color: #94a3b8; font-weight: normal; }
+        .toggle-row { display: flex; align-items: center; gap: 8px; margin-top: 10px; font-size: 0.85em; color: #94a3b8; }
+    </style>
+</head>
+<body>
+    <h2>Streaming Live RAG Engine</h2>
+    <div class="grid">
+        <div>
+            <div class="card">
+                <h3>Interactive Output &amp; Mid-Answer Patching</h3>
+                <div id="chat-box"></div>
+                <br>
+                <input type="text" id="query-input" placeholder="Ask about venue capacities, cancellations..." style="width:70%; padding:8px;">
+                <button onclick="sendFinal(false)" style="padding:8px 16px;">Send</button>
+                <button class="patch-btn" onclick="sendFinal(true)">Interrupt / Patch</button>
+                <div class="toggle-row">
+                    <input type="checkbox" id="early-search-toggle" checked>
+                    <label for="early-search-toggle">Early search (send partial text as you type) - uncheck for an A/B comparison</label>
+                </div>
+            </div>
+        </div>
+        <div>
+            <div class="card">
+                <h3>Observability Telemetry</h3>
+                <p class="stat">Status: <b id="status">Idle</b></p>
+                <p class="stat">Answer Version: <b id="version">1</b></p>
+                <p class="stat">Last Latency: <b id="latency">-</b></p>
+                <p class="stat">Index Build Time: <b id="indextime">-</b></p>
+                <p class="stat">Cache: <b id="cachehit">-</b></p>
+                <p class="stat">Retrieval started before query ended: <b id="earlystart">-</b></p>
+                <p class="stat">Time to first token: <b id="ttft">-</b></p>
+                <h4>Structured Event Stream</h4>
+                <pre id="json-telemetry">{}</pre>
+            </div>
+            <div class="card">
+                <h3>Early Search Timeline</h3>
+                <table id="early-table">
+                    <thead><tr><th>t (s)</th><th>Partial text</th><th>Top source</th></tr></thead>
+                    <tbody id="early-table-body"></tbody>
+                </table>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        const ws = new WebSocket(`ws://${location.host}/ws`);
+        const chatBox = document.getElementById('chat-box');
+        const telemetryPre = document.getElementById('json-telemetry');
+        const input = document.getElementById('query-input');
+        const earlyToggle = document.getElementById('early-search-toggle');
+        const earlyTableBody = document.getElementById('early-table-body');
+
+        let debounceTimer = null;
+
+        function renderEarlyRow(ev) {
+            const row = document.createElement('tr');
+            row.innerHTML = `<td>${ev.timestamp_s}</td><td>${ev.partial_text}</td><td>${ev.top_source}</td>`;
+            earlyTableBody.appendChild(row);
+        }
+
+        function clearEarlyTable() {
+            earlyTableBody.innerHTML = '';
+        }
+
+        function sendPartial() {
+            if (!earlyToggle.checked) {
+                console.log('[early-search] skipped: toggle is off');
+                return;
+            }
+            const text = input.value.trim();
+            if (!text) {
+                console.log('[early-search] skipped: empty text');
+                return;
+            }
+            if (ws.readyState !== WebSocket.OPEN) {
+                console.log('[early-search] skipped: websocket not open, readyState=', ws.readyState);
+                return;
+            }
+            console.log('[early-search] sending partial:', text);
+            ws.send(JSON.stringify({ text: text, partial: true }));
+        }
+
+        // Step 1: send partial text on every ~300ms pause...
+        input.addEventListener('input', () => {
+            if (debounceTimer) clearTimeout(debounceTimer);
+            debounceTimer = setTimeout(sendPartial, 300);
+        });
+
+        // ...and also immediately on a word boundary (space), per the spec.
+        input.addEventListener('keydown', (e) => {
+            if (e.key === ' ') {
+                if (debounceTimer) clearTimeout(debounceTimer);
+                sendPartial();
+            }
+            if (e.key === 'Enter') sendFinal(false);
+        });
+
+        ws.onmessage = (event) => {
+            const msg = JSON.parse(event.data);
+
+            if (msg.type === 'early_retrieval') {
+                console.log('[early-search] received early_retrieval:', msg);
+                renderEarlyRow(msg);
+            } else if (msg.type === 'telemetry') {
+                const d = msg.data;
+                document.getElementById('version').innerText = d.version;
+                document.getElementById('latency').innerText = d.total_latency_ms + ' ms';
+                if (d.index_time_s !== null && d.index_time_s !== undefined) {
+                    document.getElementById('indextime').innerText = d.index_time_s + ' s';
+                }
+                document.getElementById('cachehit').innerText = d.cache_hit ? 'HIT (instant)' : 'miss (computed fresh)';
+                document.getElementById('earlystart').innerText =
+                    (d.retrieval_started_before_query_ended_ms !== null && d.retrieval_started_before_query_ended_ms !== undefined)
+                        ? d.retrieval_started_before_query_ended_ms + ' ms'
+                        : 'n/a (early search was off or too short)';
+
+                // Authoritative replay of this utterance's early-search events,
+                // in case any arrived out of order or the live table missed one.
+                clearEarlyTable();
+                (d.early_retrieval_events || []).forEach(renderEarlyRow);
+
+                telemetryPre.innerText = JSON.stringify(d, null, 2);
+
+                if (d.status === 'waiting') {
+                    chatBox.innerHTML += '<span class="waiting">[waiting for a fuller question...]</span>\n';
+                }
+            } else if (msg.type === 'ttft') {
+                document.getElementById('ttft').innerText = msg.value + ' ms';
+            } else if (msg.type === 'token') {
+                document.getElementById('status').innerText = "Streaming...";
+                chatBox.innerText += msg.content;
+                chatBox.scrollTop = chatBox.scrollHeight;
+            } else if (msg.type === 'error') {
+                document.getElementById('status').innerText = "Error";
+                chatBox.innerHTML += `<span class="interrupted">[error] ${msg.message}</span>\n`;
+            } else if (msg.type === 'interrupted') {
+                chatBox.innerHTML += '<span class="interrupted">\n[interrupted - previous answer discarded]</span>\n';
+            } else if (msg.type === 'end') {
+                document.getElementById('status').innerText = "Completed";
+                chatBox.innerText += "\n\n";
+            }
+        };
+
+        function sendFinal(isPatch) {
+            const text = input.value;
+            if (!text) return;
+            if (debounceTimer) clearTimeout(debounceTimer);
+            document.getElementById('ttft').innerText = '-';
+            if (isPatch) {
+                chatBox.innerText += `\n[INTERRUPT / PATCH]: "${text}"\n`;
+            } else {
+                chatBox.innerText += `\nUser: ${text}\nAssistant: `;
+            }
+            ws.send(JSON.stringify({ text: text, is_patch: isPatch }));
+            input.value = '';
+        }
+    </script>
+</body>
+</html>
