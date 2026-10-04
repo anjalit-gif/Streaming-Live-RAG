@@ -1,0 +1,188 @@
+import asyncio
+import json
+import time
+from typing import Optional
+
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi.responses import HTMLResponse
+from fastapi.staticfiles import StaticFiles
+
+from app.pipeline import LiveRAGPipeline
+from app.retriever import HybridRetriever
+
+app = FastAPI(title="Streaming Live RAG Engine")
+
+SAMPLE_DOCS = [
+    {"id": "Doc_12 S2", "text": "Venue A in Pune provides workshop hall capacity for up to 35 attendees."},
+    {"id": "Doc_31 S4", "text": "Cancellation policy for workshop venues in Pune allows full refunds 48 hours prior."},
+    {"id": "Doc_09 S1", "text": "On-site catering options include breakfast, lunch, and high-tea packages."},
+    {"id": "Doc_88 S3", "text": "International travel reimbursement requires direct director approval and foreign receipts."},
+]
+
+retriever = HybridRetriever(SAMPLE_DOCS)
+pipeline = LiveRAGPipeline(retriever)
+
+# Minimum characters before a partial utterance is worth retrieving on - avoids
+# firing an embedding+BM25 call on every single keystroke of "w", "wh", "wha"...
+MIN_PARTIAL_CHARS = 4
+
+app.mount("/static", StaticFiles(directory="static"), name="static")
+
+
+@app.get("/")
+def get_ui():
+    with open("static/index.html", "r") as f:
+        return HTMLResponse(content=f.read())
+
+
+async def handle_partial(websocket: WebSocket, payload: dict, session_state: dict):
+    """Early/streaming search: as the user types, run retrieval on the partial
+    text so far - this is the 'begin retrieving before the utterance ends' idea
+    from the brief, approximated here via partial *typed* text rather than
+    partial *spoken* audio (the spec explicitly allows simulating voice input
+    from transcripts, so this is a legitimate stand-in, not a shortcut around
+    the requirement).
+
+    Deliberately lightweight: only runs retrieval (no decomposition, no LLM
+    call, no answer generation) - cheap enough to run on every pause/word
+    boundary without the cost of a full pipeline call.
+    """
+    text = payload.get("text", "").strip()
+    print(f"[early-search] received partial: {text!r} (len={len(text)})")
+    if len(text) < MIN_PARTIAL_CHARS:
+        print(f"[early-search] skipped: shorter than MIN_PARTIAL_CHARS={MIN_PARTIAL_CHARS}")
+        return
+
+    if session_state["utterance_start_time"] is None:
+        session_state["utterance_start_time"] = time.time()
+
+    loop = asyncio.get_event_loop()
+    try:
+        docs = await loop.run_in_executor(None, retriever.hybrid_retrieve, text, 1)
+    except Exception:
+        docs = []
+
+    top_source = docs[0]["id"] if docs else "none"
+    event = {
+        "timestamp_s": round(time.time() - session_state["utterance_start_time"], 2),
+        "partial_text": text,
+        "top_source": top_source,
+    }
+    session_state["partial_events"].append(event)
+
+    try:
+        await websocket.send_json({"type": "early_retrieval", **event})
+    except Exception:
+        pass  # connection may have closed between the retrieval call and this send
+
+
+async def handle_query(websocket: WebSocket, payload: dict, session_state: dict):
+    """Runs one pipeline call and streams the result.
+
+    Cancellation behavior (important for the interruption feature): the pipeline
+    call itself runs in a worker thread via run_in_executor. If this task is
+    cancelled while that call is still in flight, Python can't forcibly kill the
+    blocking call mid-execution - it finishes in the background and its result is
+    simply discarded once cancellation is requested. BUT once we reach the
+    word-by-word token streaming loop below, cancellation takes effect immediately
+    between words, so an interruption during the visible "typing" phase genuinely
+    stops the response right there.
+    """
+    utterance = payload.get("text", "")
+    is_patch = payload.get("is_patch", False)
+
+    # Pull in whatever early-search activity happened while this utterance was
+    # being typed, then reset the session for whatever gets typed next.
+    final_received_time = time.time()
+    retrieval_started_before_ms: Optional[float] = None
+    if session_state["utterance_start_time"] is not None:
+        retrieval_started_before_ms = round(
+            (final_received_time - session_state["utterance_start_time"]) * 1000, 2
+        )
+    early_events = session_state["partial_events"]
+    session_state["utterance_start_time"] = None
+    session_state["partial_events"] = []
+
+    try:
+        loop = asyncio.get_event_loop()
+        result = await loop.run_in_executor(None, pipeline.process_query, utterance, is_patch)
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:
+        await websocket.send_json({"type": "error", "message": f"{type(exc).__name__}: {exc}"})
+        return
+
+    telemetry = result.dict()
+    telemetry["early_retrieval_events"] = early_events
+    telemetry["retrieval_started_before_query_ended_ms"] = retrieval_started_before_ms
+    await websocket.send_json({"type": "telemetry", "data": telemetry})
+
+    if result.status == "waiting":
+        await websocket.send_json({"type": "end", "status": "waiting"})
+        return
+
+    first_token_sent = False
+    for word in result.answer.split(" "):
+        await asyncio.sleep(0.04)  # simulated token pacing
+        if not first_token_sent:
+            ttft_ms = round((time.time() - final_received_time) * 1000, 2)
+            await websocket.send_json({"type": "ttft", "value": ttft_ms})
+            first_token_sent = True
+        await websocket.send_json({"type": "token", "content": word + " ", "version": result.version})
+
+    await websocket.send_json({"type": "end", "status": result.status})
+
+
+@app.websocket("/ws")
+async def websocket_endpoint(websocket: WebSocket):
+    await websocket.accept()
+    pending_receive: Optional[asyncio.Task] = None
+    current_process: Optional[asyncio.Task] = None
+    # Per-connection state tracking the current in-progress utterance's partial
+    # (early-search) activity, shared between handle_partial and handle_query.
+    session_state = {"utterance_start_time": None, "partial_events": []}
+
+    try:
+        while True:
+            if pending_receive is None:
+                pending_receive = asyncio.create_task(websocket.receive_text())
+
+            wait_set = {pending_receive}
+            if current_process is not None:
+                wait_set.add(current_process)
+
+            done, _ = await asyncio.wait(wait_set, return_when=asyncio.FIRST_COMPLETED)
+
+            if current_process in done:
+                current_process = None  # finished naturally; it already sent its own output
+
+            if pending_receive in done:
+                data_str = pending_receive.result()
+                pending_receive = None
+                payload = json.loads(data_str)
+
+                if payload.get("partial"):
+                    # Partial/typing-in-progress messages never touch the
+                    # current full-answer task - they're independent, cheap,
+                    # fire-and-forget retrieval-only calls.
+                    asyncio.create_task(handle_partial(websocket, payload, session_state))
+                    continue
+
+                # Any full (non-partial) message cancels whatever full answer
+                # is currently running, whether sent via Send or Interrupt/Patch.
+                if current_process is not None:
+                    current_process.cancel()
+                    try:
+                        await current_process
+                    except asyncio.CancelledError:
+                        pass
+                    await websocket.send_json({"type": "interrupted"})
+                    current_process = None
+
+                current_process = asyncio.create_task(handle_query(websocket, payload, session_state))
+
+    except WebSocketDisconnect:
+        if current_process is not None:
+            current_process.cancel()
+        if pending_receive is not None:
+            pending_receive.cancel()
