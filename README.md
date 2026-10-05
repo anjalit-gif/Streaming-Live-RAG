@@ -2,6 +2,7 @@
 # Streaming Live RAG Engine
 
 **PRISM Generative AI Hackathon 2026-27 — Theme 04: Streaming Live RAG**
+DEMO VIDEO: https://drive.google.com/file/d/1wyqi086VAOR4NhGvqhzLF84P_I9Uh828/view?usp=sharing
 
 A retrieval-augmented conversational backend that handles a single natural
 spoken request (not a tidy search query), decomposes it into the questions
